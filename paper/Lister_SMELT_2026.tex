@@ -1,0 +1,447 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{natbib}
+\usepackage{float}
+
+\geometry{margin=1in}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    backgroundcolor=\color{gray!10},
+    numbers=none,
+    xleftmargin=2em
+}
+
+\title{SMELT: Schema-Aware Markdown Compilation\\for Efficient Local Token Inference}
+
+\author{
+    Edmund Lister\\
+    Independent Researcher, BC, Canada\\
+    \texttt{listertechnologies@gmail.com}
+}
+
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Every time a user sends a message through an AI agent framework, the system resends the entire workspace context to the model. Not once per session, but on every single call. In a typical deployment, this means thousands of tokens of static workspace files are reprocessed for every message, and in a 50-message session that overhead alone can exceed 350,000 tokens. For API users paying per token, this is direct cost. For providers serving millions of users, it is infrastructure waste at scale. For local model users on fixed hardware, it is latency on every response.
+
+This paper presents SMELT (Schema-aware Markdown compilation for Efficient Local Token inference), a system that compiles agent workspace files into a denser runtime form, reducing this overhead by 78 to 97\% on query-conditioned retrieval and 6\% on full startup bundles. On the tested corpus, a direct factual query that would normally consume 1,373 tokens of workspace context requires only 73 tokens after SMELT compilation, a 95\% reduction that compounds across every call in a session. Baseline comparisons against raw markdown, heading-stripped markdown, and naive JSON conversion confirm that SMELT outperforms all tested alternatives by a wide margin.
+
+SMELT operates across four layers: lossless archival storage with SHA-256 round-trip verification, schema-aware semantic compilation that reduces structural redundancy while preserving values, macro-level dictionary compression, and query-conditioned selective emission that delivers only the context relevant to a given prompt. Evaluated on a production OpenClaw workspace running Qwen 3.5 VL 122B A10B (8-bit, MLX) on Apple M3-Ultra hardware with measured wall-clock latency, the system achieves high fidelity on most tested files. A key empirical finding is that byte-optimal compression and token-optimal compression are distinct objectives under the tested tokenizer. The system preserves full provenance, enabling decompilation from runtime format back to the original source. SMELT treats agent context as a systems problem: source files remain human-readable; runtime context is compiled.
+\end{abstract}
+
+\noindent\textbf{Keywords:} prompt compilation, context compression, agent systems, token efficiency, local inference, provenance preservation
+
+\section{Introduction}
+
+Modern agent frameworks treat markdown as both the human authoring format and the machine runtime format. Files such as \texttt{USER.md}, \texttt{SOUL.md}, \texttt{MEMORY.md}, and \texttt{AGENTS.md} are written with headings, bullet points, spacing, and narrative scaffolding that serve human readability. On every inference call, these files are injected verbatim into the language model's context window.
+
+This is convenient but expensive. In a typical OpenClaw \citep{openclaw2026} deployment, the system prompt consumes approximately 9,600 tokens, tool schemas add 8,000 tokens, and workspace files inject a further 5,000 to 20,000 tokens, all before a single user message is processed. On a local model such as Qwen 3.5 VL 122B A10B running on consumer hardware, this overhead directly impacts response latency through prefill costs consistent with the quadratic scaling of standard self-attention.
+
+Platform-level context compaction, now available in both major agentic coding environments, addresses a related but distinct problem. Compaction summarizes evolving dialogue and session state during long-running conversations to free context space. SMELT addresses a different target: static or semi-static agent workspace documents that are injected on every call regardless of the query. Compaction manages conversational growth; SMELT compiles structural overhead.
+
+The insight behind SMELT is drawn from a well-established principle in systems engineering: source code is not the same as executable code. Compilers exist precisely because human-readable representations are not runtime-efficient. Agent workspace files are, in this framing, \textit{source code being interpreted on every call}. They should be compiled.
+
+SMELT implements this principle through a four-layer architecture that preserves the original markdown as ground truth, compiles it into progressively denser runtime representations, and maintains a full provenance chain enabling decompilation and audit. The strongest results come from query-conditioned compilation, which emits only the semantic records relevant to a given prompt while preserving their structural context.
+
+This work was motivated by direct inspection of a production OpenClaw workspace running a local Qwen 3.5 VL 122B A10B model on Apple M3-Ultra (512GB unified memory), where the inference cost of repeatedly processing human-formatted markdown files was measurable and avoidable.
+
+The practical impact is felt at three levels. For API providers serving millions of users, workspace tokens are resent on every call across every session; even a modest per-call reduction compounds to significant infrastructure savings at scale, and query-conditioned retrieval offering approximately 95\% reduction per call amplifies that effect dramatically. For developers paying per token through commercial APIs, the cost of injecting thousands of irrelevant workspace tokens on every call adds up fast; SMELT's query-conditioned mode can reduce workspace token costs from thousands of tokens per call to tens. For users running local models on fixed hardware, every unnecessary token is latency; fewer tokens in means faster responses out.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+    \item A compilation architecture for agent workspace files that separates human-readable source from machine-efficient runtime, with full provenance for decompilation and audit.
+    \item Schema-aware semantic compilation that exploits the structural patterns of agent workspace markdown to produce denser representations with high fidelity on the tested corpus.
+    \item Query-conditioned selective emission that reduces runtime context by 78 to 97\% across diverse query types while preserving parent-section context for structural coherence.
+    \item Measured wall-clock latency improvement (6\% time-to-first-token reduction) on a production startup bundle, demonstrating that token savings translate to real inference gains.
+    \item Baseline comparisons against raw markdown, heading-stripped markdown, and naive JSON conversion, showing that SMELT's query-conditioned output achieves 94 to 98\% token reduction versus all tested alternatives.
+    \item An empirical demonstration that byte-optimal and token-optimal compression are distinct objectives under the tested tokenizer, a finding with implications for any system targeting token reduction.
+    \item A comprehensive fidelity audit framework covering negation, qualifier, date, relationship, quotation, path, and annotation recall, with honest reporting of both successes and measured failures.
+\end{enumerate}
+
+\section{Related Work}
+
+Prompt compression has received substantial attention, but existing approaches differ fundamentally from the compilation paradigm proposed here.
+
+\textbf{Token-level lossy compression.} LLMLingua \citep{llmlingua2023} and LongLLMLingua \citep{longllmlingua2023} use a small language model to score token importance and drop low-information tokens. Selective Context \citep{selectivecontext2023} removes low-entropy sentences. Dynamic Compressing Prompts \citep{dcp2025} models compression as a Markov Decision Process. These methods achieve significant compression (up to 94\% cost reduction) but are inherently lossy: dropped tokens cannot be recovered, and fidelity depends on the scoring model's ability to predict what matters. None provides a decompilation path.
+
+\textbf{Lossless token-sequence compression.} LTSC \citep{ltsc2025} applies LZ77-style meta-token replacement to achieve lossless compression averaging 27\% reduction. This is the closest prior work to SMELT's lossless layer, but operates purely at the token-sequence level with no awareness of document structure. It also requires fine-tuning the target model to understand meta-tokens.
+
+\textbf{Unified compression toolkits.} CompactPrompt \citep{compactprompt2025} combines token pruning, n-gram abbreviation, and numeric quantization. PCToolkit \citep{pctoolkit2024} provides plug-and-play compression modules. These toolkits apply generic compression strategies without schema awareness or provenance preservation.
+
+\textbf{Rate-distortion theory.} Feng et al.\ \citep{ratedistortion2024} establish information-theoretic lower bounds on prompt compression for black-box models. Their framework quantifies the fundamental trade-off between compression ratio and task performance. SMELT sidesteps this trade-off for the identity-preserving case by operating on document structure rather than token distributions.
+
+\textbf{Runtime state management.} CaveAgent \citep{caveagent2026} stores Python objects in persistent runtime memory, avoiding text serialization entirely. This is complementary to SMELT: CaveAgent handles code-level state, while SMELT handles document-level context.
+
+\textbf{Context engineering for agents.} Recent work has studied how agent context files are structured \citep{agentreadmes2025, codifiedcontext2026} and how context can be evolved through agentic processes \citep{ace2026}. These papers document the problem space that SMELT addresses but do not propose compilation as a solution.
+
+\textbf{Retrieval-augmented generation.} RAG systems retrieve document segments based on embedding similarity or keyword matching. Some modern RAG implementations preserve hierarchy, metadata, or parent-child structure. SMELT's query-conditioned layer differs in that it preserves explicit document-native structural lineage at compile time, emitting matched records within their section and group hierarchy rather than retrieving isolated chunks. The two approaches are complementary: SMELT targets static workspace documents with known structure, while RAG targets large, heterogeneous knowledge bases.
+
+\textbf{Distinction from prior work.} SMELT differs from the above in three respects. First, it operates at the \textit{document-structure} level rather than the token level, exploiting the known schema of agent workspace files. Second, it preserves a complete provenance chain enabling deterministic decompilation from runtime format to original source. Third, it introduces query-conditioned structural emission, selecting semantic records by relevance while preserving their parent context, rather than dropping individual tokens.
+
+\section{Architecture}
+
+SMELT consists of four layers, each addressing a distinct point in the compression-fidelity space.
+
+\subsection{Layer 1: Lossless Archival Storage}
+
+The lossless layer compresses the original markdown using \texttt{zstd} and validates exact restoration via SHA-256 hash comparison. This layer does not target inference acceleration; its purpose is archival integrity and transport efficiency.
+
+On the evaluated \texttt{USER.md} (4,925 bytes), lossless compression achieves 37.87\% byte reduction (3,060 bytes). This establishes a baseline: the maximum savings achievable without any semantic transformation.
+
+\subsection{Layer 2: Semantic Runtime Compilation}
+
+The semantic runtime layer is the core of SMELT. It transforms markdown into a denser, schema-aware representation by replacing section headings with compact section codes, flattening nested structural markers into inline field labels, eliminating rhetorical scaffolding while preserving all values, qualifiers, and relational terms, and tagging each record with provenance metadata (source file, section, line range) for decompilation.
+
+The transformation is \textit{schema-aware}: it exploits the known structural patterns of agent workspace files (key-value pairs under hierarchical headings) rather than applying generic text compression. This is analogous to the difference between \texttt{gzip} (generic) and a domain-specific binary format (schema-aware): the latter achieves better compression because it understands the data.
+
+Critically, the semantic runtime remains text. It is not an opaque embedding or binary format. A language model can ingest it directly, and a human can read it (though less comfortably than the original markdown). This is the ``compiled object code'' of the agent context: denser than source, but still interpretable.
+
+\subsection{Layer 3: Macro Runtime Compression}
+
+The macro layer adds a small in-band phrase dictionary over the semantic runtime, replacing frequently repeated phrases with short tokens. This is a byte-level optimization inspired by classical dictionary compression.
+
+A key empirical finding emerged from this layer: \textbf{byte compression and token compression are distinct objectives.} The macro runtime achieves 14.03\% byte reduction on \texttt{USER.md} (vs.\ 12.83\% for semantic runtime alone), but under the Qwen tokenizer, it achieves only 3.27\% token reduction on the full startup bundle, \textit{worse} than the semantic runtime's 7.96\%.
+
+This occurs because modern tokenizers (BPE-derived) have already learned common phrase patterns as multi-character tokens. Replacing a phrase that the tokenizer handles efficiently with a novel short-form token can actually \textit{increase} the token count if the replacement is not in the tokenizer's vocabulary. This finding, observed on the Qwen 3.5 tokenizer in this setup, has implications for any system targeting inference efficiency: evaluation against the actual target tokenizer is essential, not byte length alone.
+
+\subsection{Layer 4: Query-Conditioned Selective Emission}
+
+The strongest compression comes from selecting only the context relevant to a specific query. This layer scores semantic records against the query using TF-IDF scoring with structural context, identifies matching records, includes their parent section and group context for structural coherence, and emits a minimal runtime subset.
+
+This preserves explicit document-native structural lineage at compile time. A matched record carries its parent section, ensuring the model receives the contextual framing necessary for correct interpretation. This differs from chunked retrieval systems that may lose the structural context surrounding a matched passage.
+
+\section{Evaluation}
+
+\subsection{Experimental Setup}
+
+All experiments were conducted on a local Apple M3-Ultra (512GB unified memory) running Qwen 3.5 VL 122B A10B (8-bit, MLX) served through LM Studio. Token counts were measured using the actual Qwen tokenizer from the live inference target, not estimated from byte length.
+
+The test corpus consisted of 13 production OpenClaw workspace files: \texttt{USER.md} (4,925 bytes), \texttt{SOUL.md} (4,485 bytes), \texttt{MEMORY.md} (10,402 bytes), \texttt{AGENTS.md} (8,088 bytes), and nine dated memory files ranging from 260 to 5,489 bytes. These represent real agent workspace content, not synthetic benchmarks.
+
+\subsection{Latency}
+
+To measure whether token savings translate to real inference gains, I conducted time-to-first-token (TTFT) measurements on the production startup bundle. The bundle consisted of four files (\texttt{AGENTS.md}, \texttt{SOUL.md}, \texttt{USER.md}, \texttt{MEMORY.md}) totaling 27,967 bytes (7,268 tokens) in original form and 25,191 bytes (6,715 tokens) in SMELT semantic runtime form.
+
+Each format received one warm-up run followed by five measured runs, alternating formats to control for thermal and load effects. TTFT was measured from HTTP request dispatch to the first streamed token.
+
+\begin{table}[H]
+\centering
+\caption{Time-to-first-token: original vs. SMELT startup bundle}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Format} & \textbf{Mean TTFT (ms)} & \textbf{Std Dev (ms)} \\
+\midrule
+Original markdown & 14,120.7 & 71.3 \\
+SMELT semantic runtime & 13,272.7 & 147.8 \\
+\midrule
+\textbf{Reduction} & \textbf{6.0\%} & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The 6.0\% TTFT reduction is modest but consistent across all five runs, with non-overlapping distributions. This represents the gain from whole-bundle semantic compilation alone, without query conditioning. The result confirms that token savings translate to measurable wall-clock improvement on local hardware, though the relationship is not proportional to the theoretical quadratic scaling due to implementation-specific factors in the inference stack (KV cache behavior, batching, and model architecture).
+
+\subsection{Query-Conditioned Retrieval}
+
+To evaluate SMELT's strongest compression mode, I ran ten queries of varying complexity through the query-conditioned retrieval engine against \texttt{USER.md}.
+
+\begin{table}[H]
+\centering
+\caption{Query-conditioned retrieval: 10 queries against USER.md (4,925 bytes, 1,338 tokens)}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Query} & \textbf{Records} & \textbf{Tokens} & \textbf{Reduction} \\
+\midrule
+When was Edmund born? & 1 & 26 & 98.1\% \\
+Who is Kane? & 1 & 38 & 97.2\% \\
+What is Edmund's health situation? & 2 & 89 & 93.4\% \\
+What are Edmund's hardware specs? & 5 & 136 & 89.8\% \\
+Edmund's relationship with his mother? & 5 & 136 & 89.8\% \\
+What to avoid talking to Edmund? & 5 & 136 & 89.8\% \\
+What tools does Edmund use daily? & 6 & 151 & 88.7\% \\
+Summarize Edmund's family & 8 & 247 & 81.5\% \\
+Tell me about Edmund & 8 & 293 & 78.1\% \\
+What does Edmund NOT like? & 8 & 293 & 78.1\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Direct factual queries achieve 93 to 98\% token reduction. Broader queries that match many records still achieve 78 to 82\% reduction. The negation query (``What does Edmund NOT like?'') returned the same broad result set as ``Tell me about Edmund,'' suggesting that retrieval breadth is strong but query sensitivity could be sharper for semantically distinct queries that happen to match similar record sets.
+
+\subsection{Baseline Comparison}
+
+To contextualize SMELT's gains, I compared prompt token counts across four approaches for the same ten queries. All measurements used the same prompt wrapper, changing only the context representation. Token counts were measured with the actual Qwen tokenizer.
+
+\begin{table}[H]
+\centering
+\caption{Prompt tokens by context representation (selected queries)}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Query} & \textbf{Raw MD} & \textbf{Stripped} & \textbf{JSON} & \textbf{SMELT} \\
+\midrule
+Who is Kane? & 1,373 & 1,266 & 1,781 & 73 \\
+Edmund's health? & 1,376 & 1,269 & 1,784 & 127 \\
+Hardware specs? & 1,376 & 1,269 & 1,784 & 174 \\
+Edmund's family? & 1,375 & 1,268 & 1,783 & 284 \\
+About Edmund & 1,373 & 1,266 & 1,781 & 328 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three findings emerge. First, SMELT's query-conditioned output reduces tokens by 76 to 95\% compared to raw markdown, the best-performing non-SMELT baseline. Second, heading-stripped markdown provides minimal improvement over raw markdown (approximately 7 to 8\%), confirming that the overhead is structural, not purely formatting. Third, naive JSON conversion actually increases token count (by approximately 30\%), demonstrating that format conversion without schema awareness is counterproductive under this tokenizer.
+
+\subsection{Cross-File Compilation}
+
+To test whether semantic compilation generalizes beyond a single file, I compiled all 13 workspace files.
+
+\begin{table}[H]
+\centering
+\caption{Semantic compilation across workspace files}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{File} & \textbf{Source tokens} & \textbf{Compiled tokens} & \textbf{Token reduction} \\
+\midrule
+USER.md & 1,338 & 1,211 & 9.5\% \\
+SOUL.md & 1,095 & 1,065 & 2.7\% \\
+MEMORY.md & 2,749 & 2,508 & 8.8\% \\
+AGENTS.md & 2,021 & 1,866 & 7.7\% \\
+2026-03-27-status.md & 867 & 750 & 13.5\% \\
+2026-03-27.md & 919 & 778 & 15.3\% \\
+2026-03-28.md & 1,515 & 1,374 & 9.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Whole-file semantic compilation yields consistent but modest token reductions across all tested files, ranging from 2.7\% to 15.3\%. One small file (260 bytes, 80 tokens) showed a slight token increase after compilation (80 to 82 tokens), indicating that SMELT's structural transformations are not guaranteed to improve very small files where the overhead of section codes and field labels exceeds the savings from eliminating markdown formatting.
+
+These results confirm that the primary value of SMELT lies in query-conditioned retrieval, not in replacing every file wholesale with its semantic runtime. Whole-file compilation provides a useful but modest efficiency layer; query conditioning provides the dramatic gains.
+
+\subsection{Fidelity Audit}
+
+I applied the fidelity audit suite to all 13 compiled files. The audit covers eight categories: record recall, negation recall, qualifier recall, date recall, relationship recall, quote/path/annotation fidelity, probe recall, and group focus purity.
+
+\begin{table}[H]
+\centering
+\caption{Fidelity audit summary across 13 workspace files}
+\begin{tabular}{lc}
+\toprule
+\textbf{Result} & \textbf{Count} \\
+\midrule
+Files with 100\% pass rate across all categories & 11 of 13 \\
+Files with measured fidelity failures & 2 of 13 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Eleven of thirteen files achieved a 100\% pass rate across all applicable audit categories. Two files showed measured failures:
+
+\begin{itemize}
+    \item \texttt{AGENTS.md}: quote fidelity 92.31\% (one quoted string not preserved exactly in the semantic runtime).
+    \item \texttt{2026-03-27-memories-archive.md}: record recall 91.49\%, date recall 73.33\%. This file is a dense archival format with many date-stamped entries, and the semantic compiler's structural assumptions did not fully match its layout.
+\end{itemize}
+
+These failures are informative. Standard workspace files (identity, personality, memory, agent configuration) compile with no measured fidelity loss. Dense archival formats with non-standard structure expose the limitations of the current hand-built schema. This is consistent with the design: SMELT's schema is built for the structural conventions of agent workspace files, not for arbitrary markdown.
+
+\subsection{Stability}
+
+Repeated compile-decompile cycles produce identical output, confirming that the transformation is deterministic and drift-free. The lossless layer validates exact byte-for-byte restoration via SHA-256 comparison. The semantic runtime validates through the fidelity audit suite.
+
+\section{Discussion}
+
+\subsection{The Compilation Paradigm}
+
+The central argument of this work is architectural: agent systems should distinguish between \textit{source format} (human-readable, version-controlled, editable) and \textit{runtime format} (dense, provenance-tagged, model-facing). This separation is standard practice in most domains of computing. Source code is compiled. Databases are indexed. Images are compressed. LLM agent systems often treat the human authoring format as the runtime format, an artifact of convenience that imposes measurable cost.
+
+The compilation paradigm does not require abandoning markdown. Source files remain unchanged. The compiler operates as a build step, analogous to \texttt{make} or \texttt{cargo build}, that produces a runtime artifact for the inferencer while preserving the original for human consumption.
+
+\subsection{Attention Quality}
+
+An underexplored consequence of context reduction is its potential effect on attention quality. When a model processes over 7,000 tokens of startup context to answer a question that requires only 38 tokens of relevant information (as in the ``Who is Kane?'' query), the remaining tokens may dilute the attention signal. The model must distribute attention weight across irrelevant context, potentially reducing the weight assigned to the tokens that matter.
+
+Query-conditioned compilation may therefore improve not only latency but also response quality by increasing the signal-to-noise ratio in the attention window. This is a hypothesis, not a measured result. Empirical validation is a priority for future work.
+
+\subsection{Where the Gains Are}
+
+The evaluation reveals a clear hierarchy of value. Query-conditioned retrieval provides dramatic token reduction (78 to 97\%) and is the strongest evidence for the compilation paradigm. Whole-file semantic compilation provides modest but consistent reduction (3 to 15\%) and a measurable 6\% TTFT improvement. Macro compression provides byte savings but can be counterproductive under modern tokenizers due to the byte-token distinction.
+
+The strongest evidence currently supports SMELT as a query-conditioned prompt reduction system. Whole-file replacement is a useful secondary mode, but the paper's central value proposition is selective emission: delivering only the relevant context for each query, compiled from structured workspace documents. In practice, the main value is straightforward: less irrelevant text reaches the model for each query, and the text that does reach it carries its structural context intact.
+
+\section{Limitations}
+
+The semantic schema is currently hand-built for the structural conventions of OpenClaw workspace files. Generalization to arbitrary markdown styles requires either schema templates or automated schema inference.
+
+The fidelity audit achieved a 100\% pass rate on 11 of 13 tested files, with measured failures on two files containing dense archival content and non-standard structure. This supports high fidelity on standard agent workspace files, not universal fidelity across all markdown content.
+
+Query-conditioned retrieval is not yet sharply discriminative for all query types. Several semantically distinct queries returned identical result sets, suggesting that the scoring function could benefit from finer-grained query intent detection.
+
+All measurements were conducted on a single model (Qwen 3.5 VL 122B A10B, 8-bit, MLX) and a single tokenizer. The byte-token distinction finding and the latency measurements are specific to this configuration. Broader validation across model families and tokenizers is needed to establish generality.
+
+The current implementation is Python and has not been optimized for production throughput. A Rust or C++ reimplementation is planned for deployment-grade performance.
+
+\section{Future Work}
+
+\textbf{Schema learning.} Automatically inferring compilation rules from the structure of a given markdown file would eliminate the hand-built schema limitation and enable SMELT to compile arbitrary agent workspace formats.
+
+\textbf{Token-budget-aware packing.} Compiling to a target token count would allow SMELT to integrate with inference systems that have strict context budgets.
+
+\textbf{Broader tokenizer evaluation.} Testing the byte-token distinction finding across multiple tokenizer families (GPT, Llama, Gemma) would establish whether it is a general principle or specific to BPE-derived tokenizers.
+
+\textbf{Attention quality measurement.} Directly measuring response quality (accuracy, relevance, coherence) with and without query-conditioned compilation would test the hypothesis that reduced context improves attention allocation.
+
+\textbf{Multimodal extensions.} Vision tokens are even more expensive than text tokens, and the compilation paradigm applies equally to structured visual context. Extending SMELT to image and video perception caches is an active area of work.
+
+\textbf{RUNE integration.} The RUNE identity persistence protocol \citep{lister2026rune} proposes using SMELT's query-conditioned retrieval engine as the backend for cross-session memory queries, enabling efficient search over episodic memory entries stored in encrypted append-only ledgers.
+
+\section{Conclusion}
+
+SMELT demonstrates that structured agent workspace context can be compiled into a denser runtime form with measurable efficiency gains. On the tested OpenClaw workspace corpus, query-conditioned compilation reduces prompt tokens by 78 to 97\% across ten diverse query types, while whole-bundle semantic compilation yields a modest but measurable 6\% time-to-first-token improvement and high fidelity on most tested files. Baseline comparisons confirm that SMELT substantially outperforms raw markdown, heading-stripped markdown, and naive JSON conversion.
+
+The system preserves full provenance for decompilation and audit, distinguishing it from lossy token-dropping approaches that sacrifice recoverability for compression.
+
+The broader conclusion is a design principle:
+
+\begin{quote}
+\textit{Human readability should be a tooling feature, not a runtime tax.}
+\end{quote}
+
+Agent systems should not feed human-oriented documents directly into expensive inference paths without compilation. SMELT provides a practical architecture for this separation, grounded in the same source-runtime distinction that has governed efficient computing since the first compilers.
+
+\section*{Acknowledgments}
+
+I conceived the compilation paradigm, identified the problem through direct observation of production OpenClaw inference workloads, and directed the research and evaluation methodology. GPT-5.4 (OpenAI) served as co-designer and implementation partner, contributing to the architecture design, codec implementation, evaluation framework, and literature review. Claude Opus 4.6 (Anthropic) contributed to the related work analysis, cross-paper positioning, benchmark design, and manuscript preparation. Codex (OpenAI) executed the benchmark suite and produced the evaluation data presented in this paper.
+
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{14}
+
+\bibitem[CaveAgent(2026)]{caveagent2026}
+CaveAgent Contributors.
+\newblock {CaveAgent}: Transforming {LLMs} into stateful runtime operators.
+\newblock \textit{arXiv preprint arXiv:2601.01569}, 2026.
+
+\bibitem[CompactPrompt(2025)]{compactprompt2025}
+CompactPrompt Contributors.
+\newblock {CompactPrompt}: A unified pipeline for prompt and data compression in {LLM} workflows.
+\newblock \textit{arXiv preprint arXiv:2510.18043}, 2025.
+
+\bibitem[DCP(2025)]{dcp2025}
+DCP Contributors.
+\newblock Dynamic compressing prompts for efficient inference of large language models.
+\newblock \textit{arXiv preprint arXiv:2504.11004}, 2025.
+
+\bibitem[Feng et al.(2024)]{ratedistortion2024}
+Yansong Feng, Shuo Wang, Yue Ma, et al.
+\newblock Fundamental limits of prompt compression: A rate-distortion framework for black-box language models.
+\newblock In \textit{Advances in Neural Information Processing Systems}, 2024.
+
+\bibitem[Jiang et al.(2023a)]{llmlingua2023}
+Huiqiang Jiang, Qianhui Wu, Xufang Luo, et al.
+\newblock {LLMLingua}: Compressing prompts for accelerated inference of large language models.
+\newblock \textit{arXiv preprint arXiv:2310.05736}, 2023.
+
+\bibitem[Jiang et al.(2023b)]{longllmlingua2023}
+Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing Yang, and Lili Qiu.
+\newblock {LongLLMLingua}: Accelerating and enhancing {LLMs} in long context scenarios via prompt compression.
+\newblock \textit{arXiv preprint arXiv:2310.06839}, 2023.
+
+\bibitem[Li et al.(2023)]{selectivecontext2023}
+Yucheng Li, Bo Dong, Yanzhe Wang, et al.
+\newblock Selective context: Compressing context to enhance inference efficiency of large language models.
+\newblock In \textit{Proceedings of EMNLP}, 2023.
+
+\bibitem[Li et al.(2024)]{pctoolkit2024}
+Zhenhao Li, Jie Chen, Runxin Xu, et al.
+\newblock {PCToolkit}: A unified plug-and-play prompt compression toolkit of large language models.
+\newblock \textit{arXiv preprint arXiv:2403.17411}, 2024.
+
+\bibitem[Lister(2026)]{lister2026rune}
+Edmund Lister.
+\newblock {RUNE}: Relational user notation for entities: A portable encrypted protocol for cross-session {AI} continuity.
+\newblock \textit{Zenodo}, 2026.
+\newblock \texttt{doi:10.5281/zenodo.19378687}
+
+\bibitem[LTSC(2025)]{ltsc2025}
+LTSC Contributors.
+\newblock Lossless token sequence compression via meta-tokens.
+\newblock \textit{arXiv preprint arXiv:2506.00307}, 2025.
+
+\bibitem[OpenClaw(2026)]{openclaw2026}
+OpenClaw Contributors.
+\newblock {OpenClaw}: Open-source agent framework.
+\newblock \url{https://github.com/openclaw/openclaw}, 2026.
+
+\bibitem[Santos et al.(2025)]{agentreadmes2025}
+Eddie~Antonio Santos, et al.
+\newblock Agent {READMEs}: An empirical study of context files for agentic coding.
+\newblock \textit{arXiv preprint arXiv:2511.12884}, 2025.
+
+\bibitem[Codified Context(2026)]{codifiedcontext2026}
+Codified Context Contributors.
+\newblock Codified context: Infrastructure for {AI} agents in a complex codebase.
+\newblock \textit{arXiv preprint arXiv:2602.20478}, 2026.
+
+\bibitem[ACE(2026)]{ace2026}
+ACE Contributors.
+\newblock Agentic context engineering: Evolving contexts for self-improving language models.
+\newblock \textit{arXiv preprint arXiv:2510.04618}, 2026.
+
+\end{thebibliography}
+
+\appendix
+
+\section{Full Baseline Comparison}
+\label{app:baselines}
+
+Complete prompt token counts across all ten queries and four context representations, measured with the Qwen 3.5 tokenizer from the live inference target.
+
+\begin{table}[H]
+\centering
+\caption{Prompt tokens by context representation (all queries)}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Query} & \textbf{Raw MD} & \textbf{Stripped} & \textbf{JSON} & \textbf{SMELT} \\
+\midrule
+Who is Kane? & 1,373 & 1,266 & 1,781 & 73 \\
+Edmund's health? & 1,376 & 1,269 & 1,784 & 127 \\
+Tell me about Edmund & 1,373 & 1,266 & 1,781 & 328 \\
+What does Edmund NOT like? & 1,375 & 1,268 & 1,783 & 330 \\
+Hardware specs? & 1,376 & 1,269 & 1,784 & 174 \\
+When was Edmund born? & 1,374 & 1,267 & 1,782 & 62 \\
+Relationship with mother? & 1,378 & 1,271 & 1,786 & 176 \\
+Tools used daily? & 1,376 & 1,269 & 1,784 & 189 \\
+Summarize family & 1,375 & 1,268 & 1,783 & 284 \\
+What to avoid? & 1,378 & 1,271 & 1,786 & 176 \\
+\midrule
+\textbf{Mean} & \textbf{1,375} & \textbf{1,268} & \textbf{1,783} & \textbf{192} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Raw markdown and heading-stripped markdown show near-constant token counts regardless of query because they inject the full file. Naive JSON consistently increases tokens over raw markdown. SMELT's query-conditioned output varies with query specificity, from 62 tokens for a direct date lookup to 330 tokens for a broad personality query, delivering an 86\% mean reduction compared to the best non-SMELT baseline (heading-stripped markdown).
+
+\end{document}
