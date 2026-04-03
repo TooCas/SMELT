@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://doi.org/10.5281/zenodo.19380983"><img src="https://zenodo.org/badge/DOI/10.5281/zenodo.19380983.svg" alt="DOI"></a>
-  <img src="https://img.shields.io/badge/license-CC--BY--NC--ND--4.0-blue" alt="License">
+  <img src="https://img.shields.io/badge/license-CC--BY--NC--SA--4.0-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10+-green" alt="Python">
 </p>
 
@@ -111,7 +111,7 @@ Includes:
 
 ## License
 
-CC-BY-NC-ND 4.0 — You can share it, but you can't modify or commercialize it without permission.
+CC-BY-NC-SA 4.0 — You can modify and build on it as long as you share under the same license and don't commercialize without permission.
 
 ## Author
 
