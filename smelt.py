@@ -50,7 +50,8 @@ FORMAT_VERSION = 1
 ZSTD_BIN = shutil.which("zstd") or "/opt/homebrew/bin/zstd"
 DEFAULT_THREADS = min(max(os.cpu_count() or 1, 1), 8)
 DEFAULT_LEVEL = 10
-ROOT = Path("/Users/studio-m3/test")
+# Portable scratch root for compiled artifacts (override with SMELT_ROOT).
+ROOT = Path(os.environ.get("SMELT_ROOT", str(Path.home() / ".cache" / "smelt")))
 INPUT_DIR = ROOT / "input"
 COMPRESSED_DIR = ROOT / "compressed"
 RESTORED_DIR = ROOT / "restored"
